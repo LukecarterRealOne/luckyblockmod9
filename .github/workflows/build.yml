@@ -1,0 +1,114 @@
+name: Build Lucky Block Mod
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Find or extract source BEFORE setting up Gradle, because some setup/cache
+      # steps expect a Gradle project to already exist in the checked-out workspace.
+      - name: Find or extract Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_build_files() {
+            find . \
+              -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
+              -type f \( -name build.gradle -o -name build.gradle.kts \) -print | sort
+          }
+
+          # Prefer a project checked in directly at the repository root.
+          if [[ -f build.gradle || -f build.gradle.kts ]]; then
+            build_file="$( [[ -f build.gradle ]] && echo build.gradle || echo build.gradle.kts )"
+            candidates=("$build_file")
+          else
+            mapfile -t candidates < <(find_build_files)
+          fi
+
+          # If the repository contains only a ZIP, extract ONE archive. Prefer the
+          # usual Lucky Block source filename so an older leftover ZIP cannot win
+          # merely because its path sorts first.
+          if (( ${#candidates[@]} == 0 )); then
+            archive=''
+            preferred='./luckyblockmod-forge-upgraded.zip'
+            if [[ -f "$preferred" ]] && unzip -Z1 "$preferred" | grep -Eq '(^|/)build\.gradle(\.kts)?$'; then
+              archive="$preferred"
+            else
+              while IFS= read -r -d '' candidate; do
+                if unzip -Z1 "$candidate" | grep -Eq '(^|/)build\.gradle(\.kts)?$'; then
+                  archive="$candidate"
+                  break
+                fi
+              done < <(find . \
+                -path './.git' -prune -o \
+                -path './.ci-unpacked' -prune -o \
+                -type f -iname '*.zip' -print0 | sort -z)
+            fi
+
+            if [[ -z "$archive" ]]; then
+              echo 'ERROR: No build.gradle/build.gradle.kts was found, and no source ZIP containing one is available.'
+              echo 'Upload extracted source files or replace luckyblockmod-forge-upgraded.zip with the latest source bundle.'
+              find . -path './.git' -prune -o -type f -print | sort | head -150
+              exit 1
+            fi
+
+            mkdir -p .ci-unpacked
+            dest=".ci-unpacked/$(basename "${archive%.*}")"
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            echo "Extracting source archive: $archive -> $dest"
+            unzip -oq "$archive" -d "$dest"
+            mapfile -t candidates < <(find "$dest" \
+              -type d \( -name .gradle -o -name build \) -prune -o \
+              -type f \( -name build.gradle -o -name build.gradle.kts \) -print | sort)
+          fi
+
+          if (( ${#candidates[@]} == 0 )); then
+            echo 'ERROR: Source was extracted but no Gradle build file was found.'
+            exit 1
+          fi
+
+          build_file="${candidates[0]}"
+          project_dir="$(dirname "$build_file")"
+          project_dir="${project_dir#./}"
+          [[ "$project_dir" == "$build_file" ]] && project_dir='.'
+          test -d "$project_dir/src" || { echo "ERROR: $project_dir has no src/ folder."; exit 1; }
+          if [[ ! -f "$project_dir/settings.gradle" && ! -f "$project_dir/settings.gradle.kts" ]]; then
+            echo "ERROR: $project_dir has no settings.gradle/settings.gradle.kts."
+            exit 1
+          fi
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Gradle project found at: $project_dir"
+
+      - name: Set up Gradle 8.8
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.8'
+
+      - name: Build mod
+        run: gradle --no-daemon --stacktrace -p "${{ steps.project.outputs.dir }}" clean build
+
+      - name: Upload mod JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: luckyblockmod-forge-jar
+          path: ${{ steps.project.outputs.dir }}/build/libs/*.jar
+          if-no-files-found: error
